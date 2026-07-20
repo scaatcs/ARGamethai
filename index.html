@@ -205,6 +205,12 @@
         let activeWords = [];
         let audioCtx;
 
+        // Grab tuning constants
+        const PINCH_START_RATIO = 0.05;   // นิ้วต้องจีบแน่นระดับนี้จึงจะเริ่มจับ
+        const PINCH_RELEASE_RATIO = 0.09; // hysteresis: จับค้างจนกว่านิ้วจะอ้ากว้างเกินระดับนี้จึงปล่อย
+        const RELEASE_GRACE_FRAMES = 6;   // ทนต่อ tracking หลุด/สั่น ~100ms ก่อนปล่อยจริง
+        const GRAB_FOLLOW_LERP = 0.5;     // ตามมือเร็วขึ้น ไม่ลากหลุด
+
         class AudioSystem {
             constructor() {
                 this.initialized = false;
@@ -591,6 +597,33 @@
             }
         }
 
+        function drawWord(word) {
+            ctx.save();
+            ctx.translate(word.x, word.y);
+
+            // Bubble shadow glow
+            ctx.shadowColor = word.isGrabbed ? "rgba(255, 235, 59, 0.5)" : "rgba(0, 0, 0, 0.25)";
+            ctx.shadowBlur = word.isGrabbed ? 15 : 8;
+
+            // Bubble background
+            ctx.beginPath();
+            ctx.arc(0, 0, word.radius, 0, Math.PI * 2);
+            ctx.fillStyle = word.isGrabbed ? "rgba(255, 255, 255, 0.95)" : "rgba(255, 255, 255, 0.85)";
+            ctx.fill();
+            ctx.lineWidth = word.isGrabbed ? 4 : 2.5;
+            ctx.strokeStyle = word.isGrabbed ? "#ffeb3b" : "#ffffff";
+            ctx.stroke();
+
+            // Text rendering
+            ctx.shadowColor = "transparent";
+            ctx.fillStyle = "#1e293b";
+            ctx.font = "bold 26px 'Sarabun', sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(word.text, 0, 1);
+            ctx.restore();
+        }
+
         function gameLoop() {
             const isActive = (gameState === 'PLAYING' || gameState === 'COUNTDOWN');
             handsData = [];
@@ -618,11 +651,12 @@
                         const indexTip = { x: mapX(marks[8].x), y: mapY(marks[8].y) };
                         
                         const distance = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
-                        const isPinching = distance < (window.innerWidth * 0.05);
-                        
+                        const pinchRatio = distance / window.innerWidth;
+                        const isPinching = pinchRatio < PINCH_START_RATIO;
+
                         const center = { x: (thumbTip.x + indexTip.x)/2, y: (thumbTip.y + indexTip.y)/2 };
-                        
-                        handsData.push({ id: handedness, indexTip, thumbTip, center, isPinching });
+
+                        handsData.push({ id: handedness, indexTip, thumbTip, center, isPinching, pinchRatio });
                     }
                 }
             }
@@ -688,21 +722,47 @@
                 let timeLeftRatio = timer / 60; // 1.0 (start) down to 0.0 (end)
                 let timeSpeedMultiplier = 1.0 + (1.0 - timeLeftRatio) * 1.5; 
 
+                // Hands already holding a word this frame — prevent one hand grabbing multiple words
+                const occupiedHands = new Set(
+                    activeWords.filter(w => w.isGrabbed && w.grabberId).map(w => w.grabberId)
+                );
+
                 // Update falling Words physics
                 for (let i = activeWords.length - 1; i >= 0; i--) {
                     let word = activeWords[i];
                     let currentlyGrabbedBy = null;
-                    
+
                     if (word.isGrabbed) {
                         const grabbingHand = handsData.find(h => h.id === word.grabberId);
-                        if (grabbingHand && grabbingHand.isPinching) {
-                            word.x = word.x + (grabbingHand.center.x - word.x) * 0.3;
-                            word.y = word.y + (grabbingHand.center.y - word.y) * 0.3;
+                        // Hysteresis: ยังจับอยู่ตราบใดที่นิ้วยังไม่อ้าเกิน PINCH_RELEASE_RATIO
+                        const stillHolding = grabbingHand && grabbingHand.pinchRatio < PINCH_RELEASE_RATIO;
+
+                        if (stillHolding) {
+                            word.releaseFrames = 0;
+                            word.x += (grabbingHand.center.x - word.x) * GRAB_FOLLOW_LERP;
+                            word.y += (grabbingHand.center.y - word.y) * GRAB_FOLLOW_LERP;
                             currentlyGrabbedBy = grabbingHand.id;
                         } else {
-                            // Released from hand
+                            // นิ้วอ้า หรือ มือหลุด tracking — อาจเป็นแค่การสั่นชั่วขณะ รอ grace period ก่อนปล่อยจริง
+                            word.releaseFrames = (word.releaseFrames || 0) + 1;
+
+                            // ระหว่าง grace ถ้ายังเห็นมืออยู่ให้เกาะมือไว้ ไม่ให้ร่วง
+                            if (grabbingHand) {
+                                word.x += (grabbingHand.center.x - word.x) * GRAB_FOLLOW_LERP;
+                                word.y += (grabbingHand.center.y - word.y) * GRAB_FOLLOW_LERP;
+                                currentlyGrabbedBy = grabbingHand.id;
+                            }
+
+                            if (word.releaseFrames < RELEASE_GRACE_FRAMES) {
+                                // ยังไม่ปล่อย — วาดคำต่อแล้วข้ามไป word ถัดไป
+                                drawWord(word);
+                                continue;
+                            }
+
+                            // ยืนยันการปล่อยแล้ว
                             word.isGrabbed = false;
                             word.grabberId = null;
+                            word.releaseFrames = 0;
                             audio.playBeep();
 
                             // Check collision with baskets
@@ -736,52 +796,31 @@
                     } else {
                         // Apply dynamic speed multiplier directly to the downward motion
                         word.y += word.baseSpeed * timeSpeedMultiplier;
-                        
-                        handsData.forEach(hand => {
-                            if (hand.isPinching && !currentlyGrabbedBy) {
+
+                        for (const hand of handsData) {
+                            if (currentlyGrabbedBy) break;
+                            // ต้องจีบแน่น (start ratio) และมือนี้ยังไม่ได้จับคำอื่นอยู่
+                            if (hand.pinchRatio < PINCH_START_RATIO && !occupiedHands.has(hand.id)) {
                                 const distSq = Math.pow(hand.center.x - word.x, 2) + Math.pow(hand.center.y - word.y, 2);
-                                if (distSq < Math.pow(word.radius + 30, 2)) {
+                                if (distSq < Math.pow(word.radius + 40, 2)) {
                                     word.isGrabbed = true;
                                     word.grabberId = hand.id;
+                                    word.releaseFrames = 0;
                                     currentlyGrabbedBy = hand.id;
+                                    occupiedHands.add(hand.id);
                                     audio.playGrab();
                                 }
                             }
-                        });
-                        
+                        }
+
                         // Delete word if fell off screen
                         if (word.y > window.innerHeight + 100 && activeWords[i]) {
                             activeWords.splice(i, 1);
                         }
                     }
-                    
-                    // Draw Word Bubble UI
-                    if (activeWords[i]) {
-                        ctx.save();
-                        ctx.translate(word.x, word.y);
-                        
-                        // Bubble shadow glow
-                        ctx.shadowColor = word.isGrabbed ? "rgba(255, 235, 59, 0.5)" : "rgba(0, 0, 0, 0.25)";
-                        ctx.shadowBlur = word.isGrabbed ? 15 : 8;
 
-                        // Bubble background
-                        ctx.beginPath();
-                        ctx.arc(0, 0, word.radius, 0, Math.PI * 2);
-                        ctx.fillStyle = word.isGrabbed ? "rgba(255, 255, 255, 0.95)" : "rgba(255, 255, 255, 0.85)";
-                        ctx.fill();
-                        ctx.lineWidth = word.isGrabbed ? 4 : 2.5;
-                        ctx.strokeStyle = word.isGrabbed ? "#ffeb3b" : "#ffffff";
-                        ctx.stroke();
-                        
-                        // Text rendering
-                        ctx.shadowColor = "transparent";
-                        ctx.fillStyle = "#1e293b";
-                        ctx.font = "bold 26px 'Sarabun', sans-serif";
-                        ctx.textAlign = "center";
-                        ctx.textBaseline = "middle";
-                        ctx.fillText(word.text, 0, 1);
-                        ctx.restore();
-                    }
+                    // Draw Word Bubble UI
+                    if (activeWords[i]) drawWord(word);
                 }
             }
 
